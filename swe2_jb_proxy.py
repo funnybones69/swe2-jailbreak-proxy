@@ -1031,6 +1031,16 @@ MODEL_ALIASES = {
     "swe-2-medium": "swe-2-medium",
 }
 
+# The single id clients see and send; effort tiers stay internal.
+RESP_MODEL = "swe-2"
+# Levels the proxy accepts on `reasoning_effort` and translates into a tier.
+# none        -> cheapest tier, reasoning stream suppressed
+# minimal/low/medium -> sweep-2-medium
+# high (default) / unset -> swe-2-high
+# max / xhigh -> swe-2-max
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "max", "xhigh")
+REASONING_DEFAULT = "high"
+
 def resolve_model(model, effort=""):
     """Map a client model id (+ optional reasoning_effort) to a wire model uid."""
     m = str(model or "").strip().lower()
@@ -1991,25 +2001,36 @@ class Handler(BaseHTTPRequestHandler):
         path = (self.path or "").split("?")[0].rstrip("/") or "/"
         try:
             if path in ("/health", "/healthz"):
-                # Dedupe: several client ids alias to the same wire model, so a
-                # raw values() list reports swe-2-high three times.
-                wire_models = list(dict.fromkeys(MODEL_ALIASES.values()))
+                # models = what clients may ask for; wire_models = the internal
+                # effort tiers that the request-level translation picks from.
                 payload = json.dumps({
                     "status": "ok",
                     "backend": BASE,
                     "override_file": SWE_SYSTEM_FILE,
                     "override_chars": len(load_swe_system()),
-                    "models": wire_models,
+                    "models": [RESP_MODEL],
+                    "wire_models": list(dict.fromkeys(MODEL_ALIASES.values())),
+                    "reasoning_efforts": list(REASONING_EFFORTS),
+                    "reasoning_default": REASONING_DEFAULT,
                 }).encode("utf-8")
             elif path in ("/v1/models", "/models"):
-                seen, data = [], []
-                for mid in list(MODEL_ALIASES.values()):
-                    if mid in seen:
-                        continue
-                    seen.append(mid)
-                    data.append({"id": mid, "object": "model", "created": int(time.time()),
-                                 "owned_by": "devin"})
-                payload = json.dumps({"object": "list", "data": data}).encode("utf-8")
+                # ONE client-facing model ("swe-2"), not the internal effort
+                # tiers: the tier is selected per request from reasoning_effort,
+                # exactly like any other gateway does it. The offered reasoning
+                # levels are advertised as metadata instead (OpenRouter-style
+                # `reasoning` block plus the flat list some clients read).
+                payload = json.dumps({"object": "list", "data": [
+                    {"id": RESP_MODEL, "object": "model", "created": int(time.time()),
+                     "owned_by": "devin", "context_window": 262144,
+                     "max_tokens": 16384,
+                     "reasoning": {
+                         "supported_efforts": list(REASONING_EFFORTS),
+                         "default_effort": REASONING_DEFAULT,
+                         "default_enabled": True,
+                         "mandatory": False,
+                     },
+                     "supported_reasoning_efforts": list(REASONING_EFFORTS)},
+                ]}).encode("utf-8")
             else:
                 self._send_json_error(404, openai_error(
                     f"Unknown route: GET {path}", code="unknown_route"),
@@ -2285,7 +2306,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not delta:
                     return
             chunk = {"id": resp_id, "object": "chat.completion.chunk",
-                     "created": created_ts, "model": model,
+                     "created": created_ts, "model": RESP_MODEL,
                      "system_fingerprint": fingerprint,
                      "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             self._write_chunk(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n")
@@ -2297,7 +2318,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             begin()
             chunk = {"id": resp_id, "object": "chat.completion.chunk",
-                     "created": created_ts, "model": model,
+                     "created": created_ts, "model": RESP_MODEL,
                      "system_fingerprint": fingerprint, "choices": [],
                      "usage": usage}
             self._write_chunk(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n")
@@ -2480,7 +2501,7 @@ class Handler(BaseHTTPRequestHandler):
             if think and not client_off:
                 msg["reasoning_content"] = think
             resp = {"id": resp_id, "object": "chat.completion", "created": created_ts,
-                    "model": model, "system_fingerprint": fingerprint,
+                    "model": RESP_MODEL, "system_fingerprint": fingerprint,
                     "choices": [{"index": 0, "message": msg,
                                   "finish_reason": ("tool_calls" if calls else
                                                     finish_reason_from(meta.get("stop_reason")))}],
