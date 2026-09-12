@@ -1032,13 +1032,20 @@ MODEL_ALIASES = {
 }
 
 # The single id clients see and send; effort tiers stay internal.
+# Naming mirrors the native provider (pi-catalog devin discovery): the id is the
+# normalized server label ("SWE-2" -> "swe-2") and the display name is the
+# label itself; effort lanes are resolved per request, never exposed as models.
 RESP_MODEL = "swe-2"
+RESP_NAME = "SWE-2"
 # Levels the proxy accepts on `reasoning_effort` and translates into a tier.
-# none        -> cheapest tier, reasoning stream suppressed
-# minimal/low/medium -> sweep-2-medium
+# Native ladder is off -> minimal -> low -> medium -> high -> xhigh -> max;
+# "none" is the OpenAI spelling of the same thing as "off".
+# off/none   -> cheapest tier, reasoning stream suppressed
+# minimal/low/medium -> swe-2-medium
 # high (default) / unset -> swe-2-high
-# max / xhigh -> swe-2-max
-REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "max", "xhigh")
+# xhigh/max -> swe-2-max
+REASONING_EFFORTS = ("off", "none", "minimal", "low", "medium", "high",
+                     "xhigh", "max")
 REASONING_DEFAULT = "high"
 
 def resolve_model(model, effort=""):
@@ -2021,6 +2028,7 @@ class Handler(BaseHTTPRequestHandler):
                 # `reasoning` block plus the flat list some clients read).
                 payload = json.dumps({"object": "list", "data": [
                     {"id": RESP_MODEL, "object": "model", "created": int(time.time()),
+                     "name": RESP_NAME,
                      "owned_by": "devin", "context_window": 262144,
                      "max_tokens": 16384,
                      "reasoning": {
