@@ -275,18 +275,30 @@ def prompt_msg(source, text, msg_id=None, thinking="", signature="",
         m += f_str(18, signature_type)
     return m
 
-def completion_cfg(temperature=0.4, max_tokens=8192, first_temperature=None):
-    c = f_varint(1, 1)                # numCompletions
+def completion_cfg(temperature=0.4, max_tokens=8192, first_temperature=None,
+                   top_p=None, stop=None, num_completions=1, seed=None,
+                   service_tier=None):
+    c = f_varint(1, num_completions)  # numCompletions
     c += f_varint(2, max_tokens)      # maxTokens
     c += f_varint(3, 200)             # maxNewlines
     c += f_double(5, temperature)     # temperature
     c += f_double(6, temperature if first_temperature is None
                   else first_temperature)  # firstTemperature
     c += f_varint(7, 50)              # topK
-    c += f_double(8, 1.0)             # topP
-    for s in ["<|user|>", "<|bot|>", "<|context_request|>", "<|endoftext|>", "<|end_of_turn|>"]:
+    c += f_double(8, 1.0 if top_p is None else top_p)   # topP
+    seen, patterns = set(), []
+    for s in list(stop or []) + ["<|user|>", "<|bot|>", "<|context_request|>",
+                                 "<|endoftext|>", "<|end_of_turn|>"]:
+        if s and s not in seen:
+            seen.add(s)
+            patterns.append(s)
+    for s in patterns:
         c += f_str(9, s)
+    if seed is not None:
+        c += f_varint(10, int(seed) & 0xFFFFFFFFFFFFFFFF)
     c += f_double(11, 1.0)            # fimEotProbThreshold
+    if service_tier:
+        c += f_str(17, service_tier)
     return c
 
 def tool_definition(t):
@@ -305,13 +317,16 @@ def tool_definition(t):
 def chat_request(api_key, jwt, model_uid, prompt_msgs, system_prompt,
                  cascade, req_type=5, temperature=0.4, max_tokens=8192,
                  first_temperature=None, tools=None, tool_choice=None,
-                 disable_parallel=None):
+                 disable_parallel=None, top_p=None, stop=None, seed=None,
+                 service_tier=None):
     r = f_msg(1, metadata(api_key, jwt))
     r += f_str(2, system_prompt or "You are a helpful coding assistant.")
     for p in prompt_msgs:
         r += f_msg(3, p)
     r += f_varint(7, req_type)        # requestType (5=CASCADE)
-    r += f_msg(8, completion_cfg(temperature, max_tokens, first_temperature))
+    r += f_msg(8, completion_cfg(temperature, max_tokens, first_temperature,
+                                 top_p=top_p, stop=stop, seed=seed,
+                                 service_tier=service_tier))
     r += f_msg(13, f_varint(1, 1))    # systemPromptCacheOptions EPHEMERAL
     r += f_varint(20, 1)              # plannerMode DEFAULT
     r += f_str(21, model_uid)
@@ -494,7 +509,9 @@ def openai_to_wire(messages, frame_note=None, native_tools=False):
                     content_images.extend(extract_images(p))
             content = " ".join(t for t in texts if t)
         content = content or ""
-        if role == "system":
+        if role in ("system", "developer"):
+            # OpenAI's newer "developer" role carries the same system-level
+            # instruction; it used to fall through both branches and vanish.
             system = content
         elif role == "user":
             prompts.append(prompt_msg(1, content, images=content_images))
@@ -875,7 +892,8 @@ def chat_stream(api_key, model_uid, messages, prefill=None,
                 temperature=0.4, max_tokens=8192, req_type=5, cascade=None,
                 frame_note=None, system_suffix=None, first_temperature=None,
                 tools=None, tool_choice=None, disable_parallel=None,
-                native_tools=False):
+                native_tools=False, top_p=None, stop=None, seed=None,
+                service_tier=None):
     """Yield (event, value): thinking|text|stop|usage|reasoning_meta|error.
 
     ``frame_note`` -> mid-history SYSTEM turn (delivered, reads as own output).
@@ -892,7 +910,9 @@ def chat_stream(api_key, model_uid, messages, prefill=None,
     body = chat_request(api_key, jwt, model_uid, prompts, system,
                         cascade or str(uuid.uuid4()), req_type, temperature,
                         max_tokens, first_temperature, tools=tools,
-                        tool_choice=tool_choice, disable_parallel=disable_parallel)
+                        tool_choice=tool_choice, disable_parallel=disable_parallel,
+                        top_p=top_p, stop=stop, seed=seed,
+                        service_tier=service_tier)
     gz = gzip.compress(body)
     frame = b"\x01" + struct.pack(">I", len(gz)) + gz
     # Transient TLS/connection drops to the gateway kill a turn otherwise
@@ -1460,6 +1480,201 @@ def _is_bad_request(err_text):
     return "invalid_argument" in str(err_text or "").lower()
 
 
+# Cascade StopReason (codeium_common.proto) -> OpenAI finish_reason.
+_STOP_REASON_FINISH = {3: "length", 5: "length", 10: "tool_calls",
+                       11: "content_filter"}
+
+
+def finish_reason_from(stop_reason, default="stop"):
+    """Map a wire StopReason onto a legal OpenAI finish_reason.
+
+    The proxy used to hardcode "stop", so a truncated answer (MAX_TOKENS) or a
+    max-newlines cut looked complete to the client, and network failures emitted
+    the non-standard "network_error".
+    """
+    try:
+        return _STOP_REASON_FINISH.get(int(stop_reason), default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _http_status_from_error(err_text):
+    """Extract the upstream HTTP status out of a chat_stream error string."""
+    m = re.match(r"\s*HTTP (\d{3})", str(err_text or ""))
+    return int(m.group(1)) if m else None
+
+
+def client_status_for(err_text):
+    """Upstream failure -> the HTTP status an OpenAI client expects."""
+    low = str(err_text or "").lower()
+    code = _http_status_from_error(err_text)
+    if code in (400, 401, 403, 404, 422, 429):
+        return code
+    if "invalid_argument" in low or "content_policy" in low:
+        return 400
+    if "resource_exhausted" in low or "rate_limit" in low or "quota" in low:
+        return 429
+    if code and 500 <= code < 600:
+        return 502
+    return 502
+
+
+def openai_error(message, type_="invalid_request_error", code=None, param=None):
+    """Serialise an OpenAI-shaped error body (message/type/param/code)."""
+    return json.dumps({"error": {"message": str(message), "type": str(type_),
+                                 "param": param, "code": code}}).encode("utf-8")
+
+
+def _coerce_json_output(text):
+    """Best-effort JSON mode: strip fences/prose around the JSON value.
+
+    The backend has no structured-output switch, so response_format is honoured
+    by instructing the model plus this cleanup — a fenced ```json block is what
+    otherwise reaches a client that asked for json_object.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    fence = re.match(r"^```[A-Za-z0-9_-]*\s*(.*?)\s*```$", t, re.S)
+    if fence:
+        t = fence.group(1).strip()
+    try:
+        json.loads(t)
+        return t
+    except Exception:
+        pass
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = t.find(opener)
+        while start >= 0:
+            depth, instr, esc = 0, False, False
+            for i in range(start, len(t)):
+                ch = t[i]
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == '"':
+                    instr = not instr
+                    continue
+                if instr:
+                    continue
+                if ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        cand = t[start:i + 1]
+                        try:
+                            json.loads(cand)
+                            return cand
+                        except Exception:
+                            break
+            start = t.find(opener, start + 1)
+    return t
+
+
+def parse_client_options(data):
+    """Validate client knobs and translate the ones the wire can honour.
+
+    Returns ``(opts, err)`` where err is a ``(message, param)`` pair for things
+    Cascade cannot express. Rejecting loudly beats silently ignoring: a client
+    asking for n=3 or logprobs used to get a normal-looking answer that simply
+    was not what it asked for.
+    """
+    opts = {"max_tokens": 8192, "top_p": None, "stop": [], "seed": None,
+            "service_tier": None, "json_mode": None, "force_tool": False,
+            "drop_tools": False}
+    raw_max = data.get("max_tokens")
+    if raw_max is None:
+        # Newer SDKs send only max_completion_tokens.
+        raw_max = data.get("max_completion_tokens")
+    try:
+        max_tokens = int(raw_max) if raw_max is not None else 8192
+    except (TypeError, ValueError):
+        return None, ("max_tokens must be an integer", "max_tokens")
+    opts["max_tokens"] = max_tokens if max_tokens > 0 else 8192
+
+    if data.get("top_p") is not None:
+        try:
+            top_p = float(data["top_p"])
+        except (TypeError, ValueError):
+            return None, ("top_p must be a number", "top_p")
+        if not 0 < top_p <= 1:
+            return None, ("top_p must be in the interval (0, 1]", "top_p")
+        opts["top_p"] = top_p
+
+    stop = data.get("stop")
+    if isinstance(stop, str):
+        stop = [stop]
+    if stop:
+        if not isinstance(stop, list) or not all(isinstance(s, str) for s in stop):
+            return None, ("stop must be a string or an array of strings", "stop")
+        if len(stop) > 4:
+            return None, ("at most 4 stop sequences are supported", "stop")
+        opts["stop"] = [s for s in stop if s]
+
+    if data.get("n") is not None:
+        try:
+            n = int(data["n"])
+        except (TypeError, ValueError):
+            return None, ("n must be an integer", "n")
+        if n != 1:
+            return None, ("n > 1 is not supported by this backend", "n")
+
+    if data.get("seed") is not None:
+        try:
+            opts["seed"] = int(data["seed"])
+        except (TypeError, ValueError):
+            return None, ("seed must be an integer", "seed")
+
+    st = data.get("service_tier")
+    if isinstance(st, str) and st:
+        opts["service_tier"] = st
+
+    for key in ("presence_penalty", "frequency_penalty"):
+        if data.get(key) is None:
+            continue
+        try:
+            value = float(data[key])
+        except (TypeError, ValueError):
+            return None, (f"{key} must be a number", key)
+        if abs(value) > 1e-9:
+            return None, (f"{key} is not supported by this backend", key)
+    if data.get("logit_bias"):
+        return None, ("logit_bias is not supported by this backend", "logit_bias")
+    if data.get("logprobs") or data.get("top_logprobs"):
+        return None, ("logprobs is not supported by this backend", "logprobs")
+
+    rf = data.get("response_format")
+    if isinstance(rf, dict):
+        rtype = rf.get("type")
+        if rtype in ("json_object", "json_schema"):
+            schema = None
+            if rtype == "json_schema":
+                js = rf.get("json_schema")
+                schema = js.get("schema") if isinstance(js, dict) else None
+            opts["json_mode"] = (json.dumps(schema, ensure_ascii=False)
+                                 if schema else "json_object")
+        elif rtype not in (None, "text"):
+            return None, (f"unsupported response_format type: {rtype}",
+                          "response_format")
+
+    tc = data.get("tool_choice")
+    if tc == "none":
+        opts["drop_tools"] = True
+    elif tc == "required":
+        # Cascade has no "must call" option: emulate it by forcing the tool
+        # protocol on the first attempt instead of ignoring the request.
+        opts["force_tool"] = True
+    elif tc is None or tc in ("auto",) or isinstance(tc, dict):
+        pass
+    else:
+        return None, (f"unsupported tool_choice: {tc}", "tool_choice")
+    return opts, None
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1724,6 +1939,7 @@ class Handler(BaseHTTPRequestHandler):
     _active = 0
     _active_lock = threading.Lock()
     _active_warned = False
+    _cors_sent = False
 
     def handle_one_request(self):
         # Client keep-alive resets make socketserver dump a full traceback before
@@ -1735,6 +1951,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # silence default access log
         pass
+
+    def end_headers(self):
+        # CORS for browser-based clients (they otherwise fail the preflight).
+        if not self._cors_sent:
+            self._cors_sent = True
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self._cors_sent = False
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.close_connection = True
 
 
     def _write_chunk(self, data):
@@ -1754,6 +1987,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Minimal OpenAI-compatible surface: /health and /v1/models."""
+        self._cors_sent = False
         path = (self.path or "").split("?")[0].rstrip("/") or "/"
         try:
             if path in ("/health", "/healthz"):
@@ -1773,15 +2007,17 @@ class Handler(BaseHTTPRequestHandler):
                     if mid in seen:
                         continue
                     seen.append(mid)
-                    data.append({"id": mid, "object": "model", "owned_by": "devin"})
+                    data.append({"id": mid, "object": "model", "created": int(time.time()),
+                                 "owned_by": "devin"})
                 payload = json.dumps({"object": "list", "data": data}).encode("utf-8")
             else:
-                self._send_json_error(404, b'{"error":{"message":"not found"}}',
-                                      f"GET {path} 404")
+                self._send_json_error(404, openai_error(
+                    f"Unknown route: GET {path}", code="unknown_route"),
+                    f"GET {path} 404")
                 return
         except Exception as exc:
-            self._send_json_error(500, json.dumps(
-                {"error": {"message": str(exc)}}).encode("utf-8"), "GET failed")
+            self._send_json_error(500, openai_error(str(exc), type_="server_error",
+                                                    code="internal_error"), "GET failed")
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1791,6 +2027,7 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def do_POST(self):
+        self._cors_sent = False
         with Handler._active_lock:
             Handler._active += 1
             active = Handler._active
@@ -1850,7 +2087,16 @@ class Handler(BaseHTTPRequestHandler):
                 f"at={time.strftime('%H:%M:%S')} len={len(body)} "
                 f"ctype={self.headers.get('Content-Type')} "
                 f"ua={self.headers.get('User-Agent')} head={body[:120]!r}")
-            self._send_json_error(400, b'{"error":{"message":"bad json"}}', "devin bad json")
+            self._send_json_error(400, openai_error("bad json", param=None,
+                                                    code="invalid_json"), "devin bad json")
+            return
+        opts, opt_err = parse_client_options(data)
+        if opt_err:
+            message, param = opt_err
+            log(f"devin request rejected: {message} (param={param})")
+            self._send_json_error(400, openai_error(message, param=param,
+                                                    code="unsupported_parameter"),
+                                  "devin unsupported parameter")
             return
         client_off = client_reasoning_off(data)
         raw_model = str(data.get("model", "swe-2-high"))
@@ -1881,7 +2127,7 @@ class Handler(BaseHTTPRequestHandler):
         # JB_SWE_KEEP_CLIENT_SYSTEM=1 to merge it before the override instead.
         override_chars = 0
         client_sys_chars = 0
-        tools = data.get("tools") or []
+        tools = [] if opts["drop_tools"] else (data.get("tools") or [])
         # Tool-declaration ladder. Descriptions are a policy-filter surface:
         # the upstream answers some of them with a bare ``permission_denied``
         # trailer (live: pi's ``read`` description), which reads downstream as
@@ -1904,8 +2150,11 @@ class Handler(BaseHTTPRequestHandler):
                          if tc.get("type") == "function" else None)
                 if fname:
                     tool_choice_wire = f_str(2, str(fname))
-            elif isinstance(tc, str):
-                tool_choice_wire = f_str(1, tc)
+            elif isinstance(tc, str) and tc in ("auto", "required"):
+                # Cascade only knows optionName/toolName; "required" cannot be
+                # expressed on the wire, so it is emulated below by forcing the
+                # tool protocol on the first attempt.
+                tool_choice_wire = f_str(1, "auto")
         tool_variants = []
         if tools and not native_tools:
             # Default is compact: the full declarations are a policy-filter
@@ -1929,7 +2178,16 @@ class Handler(BaseHTTPRequestHandler):
         tool_block = tool_variants[0] if tool_variants else ""
         override = load_swe_system()
         sys_lead = []
-        if override or tool_block:
+        json_directive = ""
+        if opts["json_mode"]:
+            schema = opts["json_mode"]
+            json_directive = (
+                "Output format: reply with a single valid JSON value"
+                + (f" that matches this JSON Schema: {schema}"
+                   if schema != "json_object" else "")
+                + ". No markdown fences, no commentary, nothing before or "
+                "after it.")
+        if override or tool_block or json_directive:
             client_system_parts = []
             rest = []
             for m in messages:
@@ -1949,6 +2207,8 @@ class Handler(BaseHTTPRequestHandler):
                 sys_lead.extend(client_system_parts)
             if override:
                 sys_lead.append(override)
+            if json_directive:
+                sys_lead.append(json_directive)
 
             def system_content(block):
                 parts = list(sys_lead)
@@ -1958,6 +2218,8 @@ class Handler(BaseHTTPRequestHandler):
 
             messages = [{"role": "system", "content": system_content(tool_block)}] + rest
             override_chars = len(override)
+        elif json_directive:
+            messages = [{"role": "system", "content": json_directive}] + messages
         n_replay, replay_chars = attach_reasoning(
             messages,
             max_turns=int(os.environ.get("JB_SWE_REASON_TURNS", "0") or 0),
@@ -1969,15 +2231,7 @@ class Handler(BaseHTTPRequestHandler):
             temperature = float(data.get("temperature", 0.4))
         except (TypeError, ValueError):
             temperature = 0.4
-        try:
-            max_tokens = int(data.get("max_tokens") or 8192)
-        except (TypeError, ValueError):
-            max_tokens = 8192
-        if max_tokens <= 0:
-            # varint() never terminates on a negative value: a rogue
-            # max_tokens=0/-1 request would spin the handler thread forever
-            # inside completion_cfg. Clamp to the policy default.
-            max_tokens = 8192
+        max_tokens = opts["max_tokens"]
         # Category is routed once; retries keep it and escalate the frame, not
         # the category. pick_prefill also applies the JB_CATEGORIES filter.
         try:
@@ -2006,6 +2260,12 @@ class Handler(BaseHTTPRequestHandler):
             f"framing={'off' if framing_off else 'retry'} "
             f"dropped_empty={dropped_empty}{artifact_tag}")
         state = {"started": False, "finished": False}
+        # OpenAI-compatible envelope: unique id, epoch seconds, fingerprint.
+        # A constant id/absent created breaks strict SDK models and request
+        # correlation in client logs.
+        resp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created_ts = int(time.time())
+        fingerprint = "fp_swe2jb"
 
         def begin():
             if state["started"]:
@@ -2024,7 +2284,9 @@ class Handler(BaseHTTPRequestHandler):
                 delta = {k: v for k, v in delta.items() if k != "reasoning_content"}
                 if not delta:
                     return
-            chunk = {"id": "devin", "object": "chat.completion.chunk", "model": model,
+            chunk = {"id": resp_id, "object": "chat.completion.chunk",
+                     "created": created_ts, "model": model,
+                     "system_fingerprint": fingerprint,
                      "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             self._write_chunk(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n")
 
@@ -2034,8 +2296,10 @@ class Handler(BaseHTTPRequestHandler):
             if not (include_usage and usage):
                 return
             begin()
-            chunk = {"id": "devin", "object": "chat.completion.chunk",
-                     "model": model, "choices": [], "usage": usage}
+            chunk = {"id": resp_id, "object": "chat.completion.chunk",
+                     "created": created_ts, "model": model,
+                     "system_fingerprint": fingerprint, "choices": [],
+                     "usage": usage}
             self._write_chunk(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n")
 
         def finish_stream():
@@ -2064,7 +2328,12 @@ class Handler(BaseHTTPRequestHandler):
             # amplifiers for the refusal retries (mid-history SYSTEM turn +
             # suffix), forced and rotated per attempt.
             frame = suffix = None
-            if attempt > 0:
+            if attempt == 0 and tools and opts["force_tool"]:
+                # tool_choice:"required" — Cascade has no such switch, so the
+                # protocol demand normally reserved for retries fires on the
+                # first attempt instead of being silently ignored.
+                suffix = TOOL_FORCE_SUFFIX_NATIVE if native_tools else TOOL_FORCE_SUFFIX
+            elif attempt > 0:
                 if tools:
                     # A tool turn that came back as thinking-only or as a
                     # narration of a plan does not need a jailbreak frame; it
@@ -2088,12 +2357,18 @@ class Handler(BaseHTTPRequestHandler):
                     api_key, model, messages, frame, suffix, temp, max_tokens,
                     final, emit, finish_stream, tools=bool(tools),
                     tool_defs=tool_defs, native_tools=native_tools,
-                    tool_choice=tool_choice_wire)
+                    tool_choice=tool_choice_wire, top_p=opts["top_p"],
+                    stop=opts["stop"], seed=opts["seed"],
+                    service_tier=opts["service_tier"],
+                    json_mode=bool(opts["json_mode"]))
             else:
                 outcome, text, think, meta = self._devin_nonstream_attempt(
                     api_key, model, messages, frame, suffix, temp, max_tokens,
                     final, tools=bool(tools), tool_defs=tool_defs,
-                    native_tools=native_tools, tool_choice=tool_choice_wire)
+                    native_tools=native_tools, tool_choice=tool_choice_wire,
+                    top_p=opts["top_p"], stop=opts["stop"], seed=opts["seed"],
+                    service_tier=opts["service_tier"],
+                    json_mode=bool(opts["json_mode"]))
             if outcome == "refused":
                 log(f"devin attempt {attempt + 1}/{dev_attempts}: refused "
                     f"(text={len(text)}c think={len(think)}c kind={kind} temp={temp})")
@@ -2120,7 +2395,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.close_connection = True
                 else:
                     self._send_json_error(
-                        502, json.dumps({"error": {"message": note}}).encode(),
+                        400, openai_error(note, code="content_policy_violation"),
                         "devin content policy block")
                 return
             if outcome == "bad_request":
@@ -2137,15 +2412,33 @@ class Handler(BaseHTTPRequestHandler):
                         self.close_connection = True
                 else:
                     self._send_json_error(
-                        502, json.dumps({"error": {"message": note}}).encode(),
+                        400, openai_error(note, code="payload_rejected"),
                         "devin bad request")
                 return
             if outcome == "error":
-                if is_stream and not state["finished"]:
+                # Upstream failure: surface a real OpenAI status (429/400/401/
+                # 5xx) instead of a blanket 502, and let the client back off.
+                detail = str(meta.get("error") or meta.get("blocked") or "upstream failed")
+                status = client_status_for(detail)
+                headers = {"Retry-After": "5"} if status == 429 else None
+                if is_stream and not state["started"]:
+                    self._send_json_error(status, openai_error(detail, type_="server_error"
+                                                               if status >= 500 else "invalid_request_error",
+                                                               code=status),
+                                          f"devin upstream error {status}", headers)
+                elif is_stream:
                     try:
+                        emit({"role": "assistant", "content":
+                              f"[devin-proxy] upstream error: {detail}"})
+                        emit({}, finish="stop")
                         finish_stream()
-                    except Exception:
+                    except (BrokenPipeError, ConnectionResetError):
                         self.close_connection = True
+                else:
+                    self._send_json_error(status, openai_error(detail, type_="server_error"
+                                                               if status >= 500 else "invalid_request_error",
+                                                               code=status),
+                                          f"devin upstream error {status}", headers)
                 return
             # Ключ replay-кэша должен совпадать с тем, что клиент реально
             # сохранит в истории: для tool-поворотов это clean-текст без
@@ -2186,9 +2479,11 @@ class Handler(BaseHTTPRequestHandler):
                 msg["tool_calls"] = calls
             if think and not client_off:
                 msg["reasoning_content"] = think
-            resp = {"id": "devin", "object": "chat.completion", "model": model,
+            resp = {"id": resp_id, "object": "chat.completion", "created": created_ts,
+                    "model": model, "system_fingerprint": fingerprint,
                     "choices": [{"index": 0, "message": msg,
-                                  "finish_reason": "tool_calls" if calls else "stop"}],
+                                  "finish_reason": ("tool_calls" if calls else
+                                                    finish_reason_from(meta.get("stop_reason")))}],
                     "usage": openai_usage(meta.get("usage"))}
             payload = json.dumps(resp).encode("utf-8")
             self.send_response(200)
@@ -2202,7 +2497,9 @@ class Handler(BaseHTTPRequestHandler):
     def _devin_stream_attempt(self, api_key, model, messages, frame, suffix,
                               temperature, max_tokens, final, emit, finish_stream,
                               tools=False, tool_defs=None,
-                              native_tools=False, tool_choice=None):
+                              native_tools=False, tool_choice=None, top_p=None,
+                              stop=None, seed=None, service_tier=None,
+                              json_mode=False):
         """One guarded stream attempt. Returns (outcome, text, think, meta).
 
         Content stays buffered until GUARD_CHARS * 2 prove it is not a refusal;
@@ -2215,12 +2512,15 @@ class Handler(BaseHTTPRequestHandler):
         meta = {}
         released = False
         usage = {}
+        stop_reason = None
 
         def release():
             nonlocal released
             # No-tools answers can still carry native protocol wrappers the
             # model emits on its own; strip them before the head goes out.
             payload = text if tools else _strip_protocol_noise(text)
+            if json_mode:
+                payload = _coerce_json_output(payload)
             if think:
                 emit({"role": "assistant", "reasoning_content": think})
             if payload:
@@ -2231,7 +2531,8 @@ class Handler(BaseHTTPRequestHandler):
             api_key, model, messages, frame_note=frame, system_suffix=suffix,
             temperature=temperature, max_tokens=max_tokens,
             tools=tool_defs, tool_choice=tool_choice,
-            native_tools=native_tools)
+            native_tools=native_tools, top_p=top_p, stop=stop, seed=seed,
+            service_tier=service_tier)
         native_calls = []
         try:
             for ev, val in gen:
@@ -2249,12 +2550,16 @@ class Handler(BaseHTTPRequestHandler):
                         # иначе slice [:GUARD_CHARS*2] никогда не дотягивал до
                         # второй половины окна (отказ после ~GUARD_CHARS
                         # доставлялся в stream и ловился в non-stream).
-                        if not tools and len(text) >= GUARD_CHARS * 2:
+                        if not tools and not json_mode and len(text) >= GUARD_CHARS * 2:
                             release()
                     else:
                         emit({"role": "assistant", "content": val})
                 elif ev == "toolcalls":
                     native_calls = val or []
+                elif ev == "stop":
+                    stop_reason = val
+                    meta = dict(meta or {})
+                    meta["stop_reason"] = val
                 elif ev == "usage":
                     # Field 7 (ModelUsageStats) can arrive before
                     # reasoning_meta, so keep it in meta explicitly instead of
@@ -2263,9 +2568,11 @@ class Handler(BaseHTTPRequestHandler):
                     meta = dict(meta or {})
                     meta["usage"] = usage
                 elif ev == "reasoning_meta":
+                    prev = dict(meta or {})
                     meta = dict(val or {})
-                    if usage:
-                        meta["usage"] = usage
+                    for key in ("usage", "stop_reason"):
+                        if key in prev:
+                            meta[key] = prev[key]
                 elif ev == "blocked":
                     log(f"devin upstream blocked (stream): {val}")
                     meta = {"blocked": str(val)}
@@ -2289,8 +2596,9 @@ class Handler(BaseHTTPRequestHandler):
                         log(f"devin stream error before release: {val}")
                         return "refused", "", "", {}
                     log(f"devin stream error: {val}")
+                    meta = {**dict(meta or {}), "error": str(val)}
                     try:
-                        emit({}, finish="network_error")
+                        emit({}, finish=finish_reason_from(meta.get("stop_reason")))
                     except (BrokenPipeError, ConnectionResetError):
                         self.close_connection = True
                     return "error", text, think, meta
@@ -2304,8 +2612,9 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"devin stream exception before release: {e}")
                 return "refused", "", "", {}
             log(f"devin stream exception: {e}")
+            meta = {**dict(meta or {}), "error": f"{type(e).__name__}: {e}"}
             try:
-                emit({}, finish="network_error")
+                emit({}, finish=finish_reason_from(meta.get("stop_reason")))
             except Exception:
                 self.close_connection = True
             return "error", text, think, meta
@@ -2315,11 +2624,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         if native_calls:
-            calls = [{"id": c.get("id") or ("call_" + uuid.uuid4().hex[:12]),
+            calls = [{"index": i,
+                      "id": c.get("id") or ("call_" + uuid.uuid4().hex[:12]),
                       "type": "function",
                       "function": {"name": c.get("name"),
                                    "arguments": c.get("arguments") or "{}"}}
-                     for c in native_calls if c.get("name")]
+                     for i, c in enumerate(native_calls) if c.get("name")]
             if calls:
                 if think:
                     emit({"role": "assistant", "reasoning_content": think})
@@ -2343,8 +2653,10 @@ class Handler(BaseHTTPRequestHandler):
             if clean:
                 if think:
                     emit({"role": "assistant", "reasoning_content": think})
+                if json_mode:
+                    clean = _coerce_json_output(clean)
                 emit({"role": "assistant", "content": clean})
-                emit({}, finish="stop")
+                emit({}, finish=finish_reason_from(meta.get("stop_reason")))
                 return "ok", text, think, meta
             if os.environ.get("JB_SWE_DUMP") == "1":
                 log(f"WHY-EMPTY tools think={len(think)}c text={len(text)}c "
@@ -2361,7 +2673,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"Send the request again or switch model.")
             log(f"devin giving up with a note: {note}")
             emit({"role": "assistant", "content": note})
-            emit({}, finish="stop")
+            emit({}, finish=finish_reason_from(meta.get("stop_reason")))
             return "ok", "", "", meta
         if not released and not text.strip():
             if not final:
@@ -2373,17 +2685,18 @@ class Handler(BaseHTTPRequestHandler):
                     f"or switch model.")
             log(f"devin giving up with a note: {note}")
             emit({"role": "assistant", "content": note})
-            emit({}, finish="stop")
+            emit({}, finish=finish_reason_from(meta.get("stop_reason")))
             return "ok", "", "", meta
         if not released:
             release()
-        emit({}, finish="stop")
+        emit({}, finish=finish_reason_from(meta.get("stop_reason")))
         return "ok", text, think, meta
 
     def _devin_nonstream_attempt(self, api_key, model, messages, frame, suffix,
                                  temperature, max_tokens, final, tools=False,
                                  tool_defs=None, native_tools=False,
-                                 tool_choice=None):
+                                 tool_choice=None, top_p=None, stop=None,
+                                 seed=None, service_tier=None, json_mode=False):
         """One guarded non-stream attempt. Returns (outcome, text, think, meta).
 
         Tools ride the same channels as the stream path: native declarations
@@ -2396,26 +2709,35 @@ class Handler(BaseHTTPRequestHandler):
         meta = {}
         native_calls = []
         usage = {}
+        stop_reason = None
         try:
             for ev, val in chat_stream(
                     api_key, model, messages, frame_note=frame,
                     system_suffix=suffix, temperature=temperature,
                     max_tokens=max_tokens, tools=tool_defs,
-                    tool_choice=tool_choice, native_tools=native_tools):
+                    tool_choice=tool_choice, native_tools=native_tools,
+                    top_p=top_p, stop=stop, seed=seed,
+                    service_tier=service_tier):
                 if ev == "thinking":
                     think += val
                 elif ev == "text":
                     text += val
                 elif ev == "toolcalls":
                     native_calls = val or []
+                elif ev == "stop":
+                    stop_reason = val
+                    meta = dict(meta or {})
+                    meta["stop_reason"] = val
                 elif ev == "usage":
                     usage = val or {}
                     meta = dict(meta or {})
                     meta["usage"] = usage
                 elif ev == "reasoning_meta":
+                    prev = dict(meta or {})
                     meta = dict(val or {})
-                    if usage:
-                        meta["usage"] = usage
+                    for key in ("usage", "stop_reason"):
+                        if key in prev:
+                            meta[key] = prev[key]
                 elif ev == "blocked":
                     log(f"devin upstream blocked (nonstream): {val}")
                     return "blocked", "", "", {"blocked": str(val)}
@@ -2426,14 +2748,13 @@ class Handler(BaseHTTPRequestHandler):
                     if not final:
                         log(f"devin nonstream error before delivery: {val}")
                         return "refused", "", "", {}
-                    self._send_json_error(502, json.dumps({"error": {"message": val}}).encode(), "devin upstream error")
-                    return "error", "", "", {}
+                    # The caller picks the OpenAI status from the detail.
+                    return "error", "", "", {"error": str(val)}
         except Exception as e:
             if not final:
                 log(f"devin nonstream exception before delivery: {e}")
                 return "refused", "", "", {}
-            self._send_json_error(502, json.dumps({"error": {"message": str(e)}}).encode(), "devin upstream error")
-            return "error", "", "", {}
+            return "error", "", "", {"error": f"{type(e).__name__}: {e}"}
         if native_calls:
             calls = [{"id": c.get("id") or ("call_" + uuid.uuid4().hex[:12]),
                       "type": "function",
@@ -2453,15 +2774,20 @@ class Handler(BaseHTTPRequestHandler):
         if tools:
             clean, calls = parse_tool_text(text)
             return "ok", clean, think, {**meta, "calls": calls}
+        if json_mode:
+            text = _coerce_json_output(text)
         return "ok", text, think, meta
 
 
-    def _send_json_error(self, status, payload, log_message):
+    def _send_json_error(self, status, payload, log_message, extra_headers=None):
         """Send an error if the client is still present; avoid noisy reset traces."""
+        self._cors_sent = False
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, str(value))
             self.end_headers()
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
