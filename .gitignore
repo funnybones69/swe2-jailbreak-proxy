@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.log
+*.err
+.env
+.venv/
+venv/
+tmp/
+.snapshot/
+tests/
+tmp_*.py
+*.bak-nomark-*
