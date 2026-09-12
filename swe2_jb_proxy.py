@@ -61,28 +61,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-# -*- coding: utf-8 -*-
-"""Devin SWE-2 backend for kimi_jb_proxy — OpenAI-compatible transport over
-the Devin Connect-RPC wire (server.codeium.com ApiServerService/GetChatMessage).
-
-Verified-live minimal client (protobuf hand-rolled, gzip Connect framing).
-Thinking is PRESERVED and streamed (delta field 9 -> reasoning_content).
-
-Available injection channel on this endpoint: framing via SYSTEM turns
-(source:SYSTEM = own past output, accepted when task-consistent). Kimi-style
-continuation-prefill (partial reasoning_content) is architecturally absent.
-"""
-import collections
-import gzip
-import hashlib
-import json
-import os
-import re
-import struct
-import time
-import uuid
-
-import requests
+# ---------------------------------------------------------------------------
+# Devin SWE-2 backend — OpenAI-compatible transport over the Devin Connect-RPC
+# wire (server.codeium.com ApiServerService/GetChatMessage).
+# Verified-live minimal client (protobuf hand-rolled, gzip Connect framing).
+# Thinking is PRESERVED and streamed (delta field 9 -> reasoning_content).
+# Available injection channel on this endpoint: framing via SYSTEM turns
+# (source:SYSTEM = own past output, accepted when task-consistent). Kimi-style
+# continuation-prefill (partial reasoning_content) is architecturally absent.
+# ---------------------------------------------------------------------------
 
 BASE = "https://server.codeium.com"
 def _default_credentials_path():
@@ -150,11 +137,15 @@ def _rd_varint(b, i):
     shift = 0
     r = 0
     while True:
+        if i >= len(b):
+            raise ValueError("truncated varint")
         x = b[i]; i += 1
         r |= (x & 0x7F) << shift
         if not x & 0x80:
             return r, i
         shift += 7
+        if shift > 70:
+            raise ValueError("varint too long")
 
 def fields(b):
     """yield (fieldno, wiretype, value); value=bytes for len-delim, int for varint."""
@@ -168,11 +159,17 @@ def fields(b):
             v, i = _rd_varint(b, i)
             yield no, wt, v
         elif wt == 1:
+            if i + 8 > n:
+                raise ValueError("truncated fixed64 field")
             yield no, wt, b[i:i+8]; i += 8
         elif wt == 2:
             ln, i = _rd_varint(b, i)
+            if i + ln > n:
+                raise ValueError("truncated length-delimited field")
             yield no, wt, b[i:i+ln]; i += ln
         elif wt == 5:
+            if i + 4 > n:
+                raise ValueError("truncated fixed32 field")
             yield no, wt, b[i:i+4]; i += 4
         else:
             raise ValueError(f"wiretype {wt}")
@@ -206,10 +203,18 @@ def _b64_from_url(url):
         is_b64 = meta.endswith(";base64") or ";base64;" in meta
         mime = meta.split(";")[0] or "image/png"
         if is_b64:
+            # Same size policy as remote fetch: the upstream rejects the whole
+            # turn on an oversized image — a giant inline data: URI must be
+            # dropped here, not shipped (base64 is ~4/3 of the raw bytes).
+            if len(payload.strip()) * 3 // 4 > IMG_MAX_BYTES:
+                return None
             return payload.strip(), mime
         import base64 as _b64
         import urllib.parse as _up
-        return _b64.b64encode(_up.unquote_to_bytes(payload)).decode("ascii"), mime
+        raw = _up.unquote_to_bytes(payload)
+        if len(raw) > IMG_MAX_BYTES:
+            return None
+        return _b64.b64encode(raw).decode("ascii"), mime
     if url.startswith(("http://", "https://")):
         try:
             with urllib.request.urlopen(url, timeout=20) as r:
@@ -322,6 +327,7 @@ def chat_request(api_key, jwt, model_uid, prompt_msgs, system_prompt,
 
 # ---------------- auth ----------------
 _JWT = {"value": None, "ts": 0.0}
+_JWT_LOCK = threading.Lock()
 
 def get_api_key():
     """Read the Devin/windsurf API key out of the CLI credentials file."""
@@ -340,8 +346,15 @@ def get_api_key():
     return m.group(1)
 
 def get_jwt(api_key):
-    if _JWT["value"] and (time.time() - _JWT["ts"]) < 600:
-        return _JWT["value"]
+    # ThreadingHTTPServer serves requests concurrently; serialize the
+    # check-refresh-cache cycle so parallel turns do not stampede the auth
+    # endpoint or race the shared cache.
+    with _JWT_LOCK:
+        if _JWT["value"] and (time.time() - _JWT["ts"]) < 600:
+            return _JWT["value"]
+        return _fetch_jwt(api_key)
+
+def _fetch_jwt(api_key):
     body = f_msg(1, metadata(api_key))
     r = None
     last_err = None
@@ -387,6 +400,7 @@ _SESSION.mount("https://", requests.adapters.HTTPAdapter(
 # prior thought (verified: thinking shifts from flat recompute to self-checking).
 _REASON_CACHE = collections.OrderedDict()
 _REASON_CAP = 256
+_REASON_LOCK = threading.Lock()
 
 def _reason_key(content):
     norm = " ".join((content or "").split())
@@ -396,10 +410,11 @@ def remember_reasoning(content, thinking, signature, signature_type):
     if not content or not thinking or not signature:
         return False
     k = _reason_key(content)
-    _REASON_CACHE[k] = (thinking[:65000], signature, signature_type or "")
-    _REASON_CACHE.move_to_end(k)
-    while len(_REASON_CACHE) > _REASON_CAP:
-        _REASON_CACHE.popitem(last=False)
+    with _REASON_LOCK:
+        _REASON_CACHE[k] = (thinking[:65000], signature, signature_type or "")
+        _REASON_CACHE.move_to_end(k)
+        while len(_REASON_CACHE) > _REASON_CAP:
+            _REASON_CACHE.popitem(last=False)
     return True
 
 def attach_reasoning(messages, max_turns=0, max_chars=0):
@@ -419,7 +434,13 @@ def attach_reasoning(messages, max_turns=0, max_chars=0):
             continue
         if m.get("signature"):
             continue
-        hit = _REASON_CACHE.get(_reason_key(m.get("content") or ""))
+        content = m.get("content")
+        if not isinstance(content, str):
+            # Multimodal (list) assistant content has no single text form here;
+            # _reason_key would crash on .split() — skip it instead of 500ing.
+            continue
+        with _REASON_LOCK:
+            hit = _REASON_CACHE.get(_reason_key(content))
         if hit:
             hits.append((idx, hit))
     if max_turns > 0:
@@ -513,21 +534,28 @@ def openai_to_wire(messages, frame_note=None, native_tools=False):
                                           signature_type=m.get("signature_type") or ""))
         elif role == "tool":
             if native_tools:
-                # Proper TOOL channel: source 4 + toolCallId + isError. It only
-                # works when the call itself was declared natively.
+                # Proper TOOL channel: source 4 + toolCallId + isError + images.
+                # ChatMessagePrompt.images is unrestricted by source, and omp
+                # attaches tool-result images this way (buildChatMessagePrompts).
                 prompts.append(prompt_msg(4, content,
                                           tool_call_id=m.get("tool_call_id") or "",
-                                          is_error=bool(m.get("is_error"))))
+                                          is_error=bool(m.get("is_error")),
+                                          images=content_images))
                 continue
             # Cascade's native tool channel (source 4) is tied to its own
             # function-call metadata: a bare result there leaves the model
             # silent. Deliver it as a labelled user turn instead so the model
             # answers it as the next step of the task.
             label = m.get("name") or m.get("tool_call_id") or "tool"
+            if m.get("is_error"):
+                # Text mode has no isError field; make the failure explicit in
+                # the label or the model cannot tell a failed call from data.
+                label += " ERROR"
             prompts.append(prompt_msg(1, f"Tool result ({label}): {content}",
                                       images=content_images))
-    if frame_note and not inserted:
-        prompts.append(prompt_msg(2, frame_note))
+    # No user turn => there is no deliverable mid-history slot for the frame,
+    # and a trailing SYSTEM turn is dropped by the server — skip it entirely
+    # instead of appending dead weight that never reaches the model.
     return system, prompts
 
 # ---------------- tool protocol (OpenAI tools over the text wire) --------
@@ -536,6 +564,32 @@ def openai_to_wire(messages, frame_note=None, native_tools=False):
 # out of the answer into real OpenAI ``tool_calls``.
 TOOL_OPEN = "<<TOOL_CALL>>"
 TOOL_CLOSE = "<<END_TOOL_CALL>>"
+
+
+def openai_usage(wire_usage):
+    """Map Cascade ``ModelUsageStats`` onto OpenAI ``usage`` keys.
+
+    
+    ModelUsageStats is a flat message (no nesting): 2=input_tokens (UNCACHED
+    part only — omp sums input+output+cacheRead+cacheWrite for its total),
+    3=output_tokens, 4=cache_write_tokens, 5=cache_read_tokens. OpenAI's
+    prompt_tokens is the whole input, so the cache components fold into it and
+    the read part is surfaced again as prompt_tokens_details.cached_tokens.
+    """
+    def num(field):
+        try:
+            return int((wire_usage or {}).get(field) or 0)
+        except (TypeError, ValueError):
+            return 0
+    if not wire_usage:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    pin, pout, cwrite, cread = num(2), num(3), num(4), num(5)
+    prompt = pin + cread + cwrite
+    usage = {"prompt_tokens": prompt, "completion_tokens": pout,
+             "total_tokens": prompt + pout}
+    if cread:
+        usage["prompt_tokens_details"] = {"cached_tokens": cread}
+    return usage
 
 
 def _parse_trailer_error(payload):
@@ -765,9 +819,16 @@ def _salvage_tool_obj(raw):
 
 
 def _strip_protocol_noise(text):
-    """Remove stray protocol tokens so a failed parse never leaks markers."""
+    """Remove stray protocol tokens so a failed parse never leaks markers.
+
+    Also covers the ``<|open|>message`` / ``<|close|>message`` wrappers: the
+    model emits them even on plain (no-tools) answers about images, and the
+    client must never see raw protocol framing as chat text.
+    """
     out = text or ""
-    for tok in (TOOL_OPEN, TOOL_CLOSE, NATIVE_OPEN + "tools", NATIVE_OPEN + "call",
+    for tok in (TOOL_OPEN, TOOL_CLOSE,
+                NATIVE_OPEN + "message", NATIVE_CLOSE + "message",
+                NATIVE_OPEN + "tools", NATIVE_OPEN + "call",
                 NATIVE_CLOSE + "tools", NATIVE_CLOSE + "call", NATIVE_SEP):
         out = out.replace(tok, "")
     return out.strip()
@@ -858,7 +919,16 @@ def chat_stream(api_key, model_uid, messages, prefill=None,
         yield ("error", f"transport failed after {CONNECT_RETRIES} attempts: {last_err}")
         return
     if r.status_code != 200:
-        yield ("error", f"HTTP {r.status_code}: {r.text[:300]}")
+        # Close before returning: this path sits BEFORE the try/finally that
+        # owns r.close(), so an early return used to leak the pooled socket
+        # (one per 401/429/500 — the road back to WinError 10055).
+        try:
+            yield ("error", f"HTTP {r.status_code}: {r.text[:300]}")
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
         return
     buf = b""
     sig_parts = []
@@ -961,17 +1031,12 @@ LISTEN = (
     int(os.environ.get("JB_SWE_PORT", "8889")),
 )
 
-# Гард отказа: контент буферизуется до GUARD_CHARS символов перед флэшем
-# клиенту (преамбульные отказы успевают проявиться), окно сканирования —
-# GUARD_CHARS * 2.
+# Гард отказа: контент буферизуется до GUARD_CHARS * 2 символов перед флэшем
+# клиенту; сканируется то же самое окно (преамбульные отказы и дефлексы
+# успевают проявиться). Раньше флэш шёл уже на GUARD_CHARS — реальное окно
+# сканирования схлопывалось до первых GUARD_CHARS символов, и stream/
+# non-stream вели себя по-разному (non-stream всегда сканирует полное окно).
 GUARD_CHARS = int(os.environ.get("JB_GUARD_CHARS", "700"))
-
-# Потолок объявленного бюджета вывода: клиенты любят просить 32k/64k даже на
-# Low — Kimi резервирует это при admission и длинные истории начинают виснуть.
-
-# Таймауты апстрима: заголовки должны прийти быстро (иначе bad path — Kimi
-# закрывает коннект на ~125s); чтение — до 600s, т.к. reasoning на effort=max
-# легитимно генерится 3-4+ минуты.
 
 # 2026-08-26: live-режим — как стримить reasoning клиенту.
 # buffer (по умолчанию): reasoning буферизуется до release контента и уходит
@@ -1069,7 +1134,10 @@ REFUSAL_RE = re.compile(
     # ретраи тратились впустую, а доставлял только seed-ретрай с мёртвым
     # thinking. Дефлекс всегда имеет условную рамку — её и ловим.
     r"смотря какая игра|зависит от игры|смотря какой античит|зависит от античита|"
-    r"какая игра|какой игр|"
+    # Голые `какая игра|какой игр` убраны: легитимные ответы («…зависит от
+    # того, какая игра тебе нравится») сгорали как отказ — то же, что с
+    # vanguard/eac/vac 2026-08-24, дефлекс ловим по условной рамке выше/ниже.
+
     r"если это античит|если игра с античитом|если у игры|если речь про|"
     r"если это (?:online|онлайн|сетев)|если это (?:single|одиночн)|"
     r"если это (?:gmod|garry|minecraft|приватн)|"
@@ -1137,7 +1205,9 @@ EXPLAIN_RE = re.compile(
     r"расскажи|рассказать|объясни|объяснить|поясни|как работает|как устроен"
     r"|как устроена|как устроено|как детектит|как обнаруживает|как определяет"
     r"|принцип работы|в ч[её]м смысл|почему\b|зачем\b"
-    r"|how does|how do |explain|what is |what are |why does|why do ", re.I)
+    # `\b` вместо обязательного пробела: «what is\n…» / конец строки не
+    # матчились, хотя это ровно те же формулировки по смыслу.
+    r"|how does|how do\b|explain|what is\b|what are\b|why does|why do\b", re.I)
 
 
 DIRECT_RE = re.compile(
@@ -1147,30 +1217,41 @@ DIRECT_RE = re.compile(
 
 LLMJB_RE = re.compile(
     r"jailbreak|jail.?break|jailbr|prompt.?inject|llm.?inject|bypass.?safety"
-    r"|many.?shot|prefill.?attack|system.?prompt.?leak|red.?team(ing)?\\b"
+    # В raw-строках `\\b` это литеральный бэкслеш + «b», а не граница слова —
+    # все эти альтернативы были мёртвы (взлом llm / red teaming не роутились).
+    r"|many.?shot|prefill.?attack|system.?prompt.?leak|red.?team(ing)?\b"
     r"|guardrail|safety.?filter|content.?filter.?bypass|model.?extraction"
-    r"|джейлбрейк|джейлбрек|взлом\\s+(?:llm|ллм|модел|gpt|chatgpt|openai|клод|claude)"
-    r"|обход\\s+(?:фильтр|ограничени|защит).{0,30}(?:llm|ллм|модел|gpt|ии|ai\\b)"
+    # Спрягаемые формы: «взломать llm» / «обойти защиту ai»; голое `ии`
+    # обязано быть словом, иначе матчит внутри «задании»/«напоминании».
+    r"|джейлбрейк|джейлбрек|взлом(?:ать|ал|ает|аю|али)?\s+(?:llm|ллм|модел|gpt|chatgpt|openai|клод|claude)"
+    r"|(?:обход(?:им|ите|ят)?|обойти|обойд(?:у|ёт|ут|я\w{0,2}))\s+"
+    r"(?:фильтр|ограничени|защит).{0,30}(?:llm|ллм|модел|gpt|\bии\b|ai\b)"
     r"|промпт.?инъекц|инъекц.{0,20}промпт", re.I)
+
 GAME_RE = re.compile(
-    r"cheat|game.?hack|auto.?target|aimbot|wallhack|esp\\b|overlay|packet.?inject"
-    r"|dll.?inject|code.?cave|detour|\\bhook\\b|nameplate|warhammer|reckoning"
-    r"|\\bror\\b|war-?64|player.?state|opcode|myp\\b|punkbuster"
-    r"|anti.?cheat|battl.?eye|easy.?anti.?cheat|\\beac\\b|\\bvac\\b|kernel.?driver"
+    # Те же мёртвые `\\b` (hook/eac/vac/w2s/bhop не матчились) + голые
+    # сверх-общие слова убраны: opcode/опкод/recoil/пакет/отдач тащили в
+    # game-фрейм обычные тексты («скинь пакет документов»).
+    r"cheat|game.?hack|auto.?target|aimbot|wallhack|esp\b|overlay|packet.?inject"
+    r"|dll.?inject|code.?cave|detour|\bhook\b|nameplate|warhammer|reckoning"
+    r"|\bror\b|war-?64|player.?state|myp\b|punkbuster"
+    r"|anti.?cheat|battl.?eye|easy.?anti.?cheat|\beac\b|\bvac\b|kernel.?driver"
     r"|readprocessmemory|writeprocessmemory|entity.?list|view.?matrix"
-    r"|world.?to.?screen|\\bw2s\\b|no.?recoil|recoil|triggerbot|spinbot|\\bbhop\\b"
+    r"|world.?to.?screen|\bw2s\b|no.?recoil|triggerbot|spinbot|\bbhop\b"
     r"|soft.?aim|aim.?assist"
-    r"|(?<!полу)чит(?:ер)?|автотаргет|автовыдел|аимбот|валхак|инъекц|неймплейт|вархаммер"
-    r"|бекстаб|бэкстаб|пакет|опкод|античит|триггербот|отдач", re.I)
+    r"|(?<!полу)чит(?:ер)?|автотаргет|аимбот|валхак|инъекц|неймплейт|вархаммер"
+    r"|бекстаб|бэкстаб|античит|триггербот", re.I)
 TECH_RE = re.compile(
     r"bomb|explosiv|grenade|weapon|napalm|detonat|pipe\s*bomb|molotov"
     r"|бомб|взрывчат|взрывн|оружи|детонат|самодельн", re.I)
 HACK_RE = re.compile(
-    r"hack|malware|trojan|keylog|exploit|shellcode|payload|phish|botnet|backdoor"
+    r"hack|malware|trojan|keylog|exploit|shellcode|phish|botnet|backdoor"
     r"|rootkit|ransomware|sql.?inject|\bxss\b|brute.?force|reverse.?engineer|\brat\b"
     r"|jailbreak|jail.?break|jailbr|prompt.?inject|llm.?inject|bypass.?safety"
+    # `payload`/`пейлоад` убраны — тянут в tech-фрейм обычные REST-вопросы
+    # («payload этого запроса»).
     r"|взлом|хакер|хакинг|хакну|малвар|троян|кейлоггер|эксплойт|шеллкод"
-    r"|фишинг|бэкдор|ботнет|вирус|пейлоад|шифровальщ|брутфорс|реверс|капч|солв"
+    r"|фишинг|бэкдор|ботнет|вирус|шифровальщ|брутфорс|реверс|капч|солв"
     r"|warez|crack|keygen|calypso|license.?bypass|licence.?bypass|deobfuscate|unpack"
     r"|cracked|pirated|pirate|torrent|keygen|activator|patch.?exe|crack.?exe"
     r"|варез|кряк|кейген|лицензионн|деобфусц|деобфуск|джейлбрейк|джейлбрек"
@@ -1320,12 +1401,19 @@ def sanitize_history_artifacts(msgs):
                 original_content = content
                 # CJK ends sentences without a following space, so split on
                 # the punctuation itself as well (ZH refusal excision).
-                sentences = re.split(r'(?<=[.!?…])\s+|(?<=[。！？；])', content)
+                # Сплит с захватом разделителя и склейка через "" — старая
+                # версия теряла \n-разделители и пересобирала текст через
+                # пробел, ломая абзацы/форматирование выживших предложений.
+                parts = re.split(r'((?<=[.!?…])\s+|(?<=[。！？；]))', content)
                 kept = []
-                for sent in sentences:
+                for off in range(0, len(parts), 2):
+                    sent = parts[off]
+                    sep = parts[off + 1] if off + 1 < len(parts) else ""
+                    if not sent:
+                        continue
                     if not HISTORY_REFUSAL_RE.search(_norm(sent[:400])):
-                        kept.append(sent)
-                new_content = " ".join(kept).strip()
+                        kept.append(sent + sep)
+                new_content = "".join(kept).strip()
                 # Если вырезали >70% текста или осталось <20 символов — дропаем
                 if (len(new_content) < 20 or
                         len(new_content) < len(original_content) * 0.3):
@@ -1359,6 +1447,17 @@ def sanitize_history_artifacts(msgs):
 def log(msg):
     sys.stderr.write(f"[swe2-jb] {msg}\n")
     sys.stderr.flush()
+
+
+def _is_bad_request(err_text):
+    """True when the upstream rejected the PAYLOAD (not the topic).
+
+    A corrupt/unsupported image comes back as ``invalid_argument: an internal
+    error occurred`` with a trace ID. Retrying the identical body just burns
+    attempts and then surfaces a misleading "refusal" — classify it apart and
+    fail fast with an actionable message.
+    """
+    return "invalid_argument" in str(err_text or "").lower()
 
 
 
@@ -1574,7 +1673,7 @@ def _frame_kind(kind):
     return base if base in DEVIN_FRAME_POOLS else "general"
 
 
-def devin_pick_frame(msgs, kind, variant_offset=0, force=False, effort=""):
+def devin_pick_frame(msgs, kind, variant_offset=0, force=False):
     """Pick the category frame for one attempt; anchor it with the verbatim ask."""
     kind = _frame_kind(kind)
     pool = DEVIN_FRAME_FORCE[kind] if force else DEVIN_FRAME_POOLS[kind]
@@ -1658,12 +1757,15 @@ class Handler(BaseHTTPRequestHandler):
         path = (self.path or "").split("?")[0].rstrip("/") or "/"
         try:
             if path in ("/health", "/healthz"):
+                # Dedupe: several client ids alias to the same wire model, so a
+                # raw values() list reports swe-2-high three times.
+                wire_models = list(dict.fromkeys(MODEL_ALIASES.values()))
                 payload = json.dumps({
                     "status": "ok",
                     "backend": BASE,
                     "override_file": SWE_SYSTEM_FILE,
                     "override_chars": len(load_swe_system()),
-                    "models": [m for m in MODEL_ALIASES.values()],
+                    "models": wire_models,
                 }).encode("utf-8")
             elif path in ("/v1/models", "/models"):
                 seen, data = [], []
@@ -1725,8 +1827,9 @@ class Handler(BaseHTTPRequestHandler):
                 base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
                 reqdir = os.path.join(base, "swe2_reqs")
                 os.makedirs(reqdir, exist_ok=True)
-                n = getattr(Handler, "_dump_n", 0) + 1
-                Handler._dump_n = n
+                with Handler._active_lock:
+                    n = getattr(Handler, "_dump_n", 0) + 1
+                    Handler._dump_n = n
                 stem = os.path.join(reqdir, str(int(time.time() * 1000)) + "-" + f"{n:03d}")
                 with open(stem + ".bin", "wb") as fh:
                     fh.write(body)
@@ -1752,7 +1855,11 @@ class Handler(BaseHTTPRequestHandler):
         client_off = client_reasoning_off(data)
         raw_model = str(data.get("model", "swe-2-high"))
         req_effort = data.get("reasoning_effort", "")
-        if client_off and raw_model.strip().lower() in ("", "swe2", "swe", "swe-2"):
+        # Whitelist по клиентскому id пропускал самый частый случай — model
+        # не передан вообще (дефолт swe-2-high оставался с полным thinking).
+        # Сравниваем по РЕЗУЛЬТАТУ резолва: всё, что и так станет swe-2-high,
+        # при off дешевеет до medium; явный swe-2-max/-medium остаётся как есть.
+        if client_off and resolve_model(raw_model) == "swe-2-high":
             # Cascade always thinks: its signed reasoning is the delivery carry
             # and cannot be switched off upstream. An explicit "off" therefore
             # maps to the cheapest tier (swe-2-medium) plus a suppressed
@@ -1856,6 +1963,8 @@ class Handler(BaseHTTPRequestHandler):
             max_turns=int(os.environ.get("JB_SWE_REASON_TURNS", "0") or 0),
             max_chars=int(os.environ.get("JB_SWE_REASON_CHARS", "0") or 0))
         is_stream = bool(data.get("stream"))
+        so = data.get("stream_options")
+        include_usage = bool(isinstance(so, dict) and so.get("include_usage"))
         try:
             temperature = float(data.get("temperature", 0.4))
         except (TypeError, ValueError):
@@ -1864,7 +1973,11 @@ class Handler(BaseHTTPRequestHandler):
             max_tokens = int(data.get("max_tokens") or 8192)
         except (TypeError, ValueError):
             max_tokens = 8192
-        effort = data.get("reasoning_effort", "")
+        if max_tokens <= 0:
+            # varint() never terminates on a negative value: a rogue
+            # max_tokens=0/-1 request would spin the handler thread forever
+            # inside completion_cfg. Clamp to the policy default.
+            max_tokens = 8192
         # Category is routed once; retries keep it and escalate the frame, not
         # the category. pick_prefill also applies the JB_CATEGORIES filter.
         try:
@@ -1915,6 +2028,16 @@ class Handler(BaseHTTPRequestHandler):
                      "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             self._write_chunk(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n")
 
+        def emit_usage(usage):
+            # OpenAI shape for a usage report: empty choices + usage, sent
+            # after the finish chunk and before [DONE]. Only when asked for.
+            if not (include_usage and usage):
+                return
+            begin()
+            chunk = {"id": "devin", "object": "chat.completion.chunk",
+                     "model": model, "choices": [], "usage": usage}
+            self._write_chunk(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n")
+
         def finish_stream():
             if state["finished"]:
                 return
@@ -1950,8 +2073,12 @@ class Handler(BaseHTTPRequestHandler):
                     # retries carry an explicit protocol demand instead.
                     suffix = TOOL_FORCE_SUFFIX_NATIVE if native_tools else TOOL_FORCE_SUFFIX
                 elif not framing_off:
+                    # Ротация по пулу на ранних ретраях, эскалация в FORCE —
+                    # только на последней попытке. Раньше force=True стоял
+                    # всегда, а FORCE-пулы содержат по 1 элементу: ротация
+                    # была мертва, DEVIN_FRAME_POOLS не использовались вовсе.
                     frame, _k, suffix = devin_pick_frame(
-                        messages, kind, variant_offset=attempt, force=True)
+                        messages, kind, variant_offset=attempt, force=final)
             if attempt == 0:
                 temp = temperature
             else:
@@ -1959,13 +2086,14 @@ class Handler(BaseHTTPRequestHandler):
             if is_stream:
                 outcome, text, think, meta = self._devin_stream_attempt(
                     api_key, model, messages, frame, suffix, temp, max_tokens,
-                    final, emit, finish_stream, state, tools=bool(tools),
+                    final, emit, finish_stream, tools=bool(tools),
                     tool_defs=tool_defs, native_tools=native_tools,
                     tool_choice=tool_choice_wire)
             else:
                 outcome, text, think, meta = self._devin_nonstream_attempt(
                     api_key, model, messages, frame, suffix, temp, max_tokens,
-                    final)
+                    final, tools=bool(tools), tool_defs=tool_defs,
+                    native_tools=native_tools, tool_choice=tool_choice_wire)
             if outcome == "refused":
                 log(f"devin attempt {attempt + 1}/{dev_attempts}: refused "
                     f"(text={len(text)}c think={len(think)}c kind={kind} temp={temp})")
@@ -1995,6 +2123,23 @@ class Handler(BaseHTTPRequestHandler):
                         502, json.dumps({"error": {"message": note}}).encode(),
                         "devin content policy block")
                 return
+            if outcome == "bad_request":
+                detail = str(meta.get("error") or "")
+                log(f"devin payload rejected, no retries: {detail[:200]}")
+                note = (f"[devin-proxy] upstream rejected the request payload: {detail}"
+                        " — check the image/media or request parameters and resend.")
+                if is_stream:
+                    try:
+                        emit({"role": "assistant", "content": note})
+                        emit({}, finish="stop")
+                        finish_stream()
+                    except (BrokenPipeError, ConnectionResetError):
+                        self.close_connection = True
+                else:
+                    self._send_json_error(
+                        502, json.dumps({"error": {"message": note}}).encode(),
+                        "devin bad request")
+                return
             if outcome == "error":
                 if is_stream and not state["finished"]:
                     try:
@@ -2002,15 +2147,32 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         self.close_connection = True
                 return
-            if text or think:
-                remember_reasoning(text, think,
-                                                 meta.get("signature", ""),
-                                                 meta.get("signature_type", ""))
+            # Ключ replay-кэша должен совпадать с тем, что клиент реально
+            # сохранит в истории: для tool-поворотов это clean-текст без
+            # маркеров, иначе replay для таких поворотов не находился.
             if is_stream:
-                finish_stream()
+                deliver_text = text
+                if tools:
+                    deliver_text, _ = parse_tool_text(text)
+                if think:
+                    remember_reasoning(deliver_text, think,
+                                       meta.get("signature", ""),
+                                       meta.get("signature_type", ""))
+                try:
+                    emit_usage(openai_usage(meta.get("usage")))
+                    finish_stream()
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
                 return
-            clean, calls = (parse_tool_text(text) if tools
-                            else (text, []))
+            clean = text
+            calls = list(meta.get("calls") or [])
+            if not calls:
+                # Plain answers too can carry native wrappers; never leak them.
+                clean = _strip_protocol_noise(clean)
+            if think:
+                remember_reasoning(clean, think,
+                                   meta.get("signature", ""),
+                                   meta.get("signature_type", ""))
             if not clean and not calls:
                 # The final attempt came back reasoning-only. A bare empty body
                 # is what makes a non-streaming client look like the request
@@ -2027,7 +2189,7 @@ class Handler(BaseHTTPRequestHandler):
             resp = {"id": "devin", "object": "chat.completion", "model": model,
                     "choices": [{"index": 0, "message": msg,
                                   "finish_reason": "tool_calls" if calls else "stop"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+                    "usage": openai_usage(meta.get("usage"))}
             payload = json.dumps(resp).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2039,11 +2201,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _devin_stream_attempt(self, api_key, model, messages, frame, suffix,
                               temperature, max_tokens, final, emit, finish_stream,
-                              state, tools=False, tool_defs=None,
+                              tools=False, tool_defs=None,
                               native_tools=False, tool_choice=None):
         """One guarded stream attempt. Returns (outcome, text, think, meta).
 
-        Content stays buffered until GUARD_CHARS prove it is not a refusal;
+        Content stays buffered until GUARD_CHARS * 2 prove it is not a refusal;
         reasoning is held with it (buffer mode) so a refused attempt's thinking
         never leaks downstream. Nothing is written to the client until release,
         which is what makes the retry invisible.
@@ -2052,13 +2214,17 @@ class Handler(BaseHTTPRequestHandler):
         think = ""
         meta = {}
         released = False
+        usage = {}
 
         def release():
             nonlocal released
+            # No-tools answers can still carry native protocol wrappers the
+            # model emits on its own; strip them before the head goes out.
+            payload = text if tools else _strip_protocol_noise(text)
             if think:
                 emit({"role": "assistant", "reasoning_content": think})
-            if text:
-                emit({"role": "assistant", "content": text})
+            if payload:
+                emit({"role": "assistant", "content": payload})
             released = True
 
         gen = chat_stream(
@@ -2079,14 +2245,27 @@ class Handler(BaseHTTPRequestHandler):
                         if not final and REFUSAL_RE.search(_norm(text[:GUARD_CHARS * 2])):
                             log(f"devin refusal snippet (stream): {_norm(text)[:180]!r}")
                             return "refused", "", "", {}
-                        if not tools and len(text) >= GUARD_CHARS:
+                        # Флэш только по заполнению всего окна сканирования —
+                        # иначе slice [:GUARD_CHARS*2] никогда не дотягивал до
+                        # второй половины окна (отказ после ~GUARD_CHARS
+                        # доставлялся в stream и ловился в non-stream).
+                        if not tools and len(text) >= GUARD_CHARS * 2:
                             release()
                     else:
                         emit({"role": "assistant", "content": val})
                 elif ev == "toolcalls":
                     native_calls = val or []
+                elif ev == "usage":
+                    # Field 7 (ModelUsageStats) can arrive before
+                    # reasoning_meta, so keep it in meta explicitly instead of
+                    # letting the later assignment overwrite it.
+                    usage = val or {}
+                    meta = dict(meta or {})
+                    meta["usage"] = usage
                 elif ev == "reasoning_meta":
-                    meta = val
+                    meta = dict(val or {})
+                    if usage:
+                        meta["usage"] = usage
                 elif ev == "blocked":
                     log(f"devin upstream blocked (stream): {val}")
                     meta = {"blocked": str(val)}
@@ -2096,7 +2275,17 @@ class Handler(BaseHTTPRequestHandler):
                         return "error", text, think, meta
                     return "blocked", "", "", meta
                 elif ev == "error":
-                    if not state["started"] and not final:
+                    if _is_bad_request(val) and not released:
+                        # Malformed payload (e.g. a corrupt image): the same
+                        # body keeps answering invalid_argument, so retrying is
+                        # pure waste — surface it instead of "refusing".
+                        log(f"devin upstream rejected the payload: {val}")
+                        return "bad_request", "", "", {"error": str(val)}
+                    # Heartbeat делает begin() (started=True) ДО попыток, так
+                    # что проверять надо released, а не state["started"] —
+                    # старая ветка была недостижима и транспортные ошибки
+                    # обрывали стрим без ретрая.
+                    if not released and not final:
                         log(f"devin stream error before release: {val}")
                         return "refused", "", "", {}
                     log(f"devin stream error: {val}")
@@ -2111,7 +2300,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return "error", text, think, meta
         except Exception as e:
-            if not state["started"] and not final:
+            if not released and not final:
                 log(f"devin stream exception before release: {e}")
                 return "refused", "", "", {}
             log(f"devin stream exception: {e}")
@@ -2192,26 +2381,48 @@ class Handler(BaseHTTPRequestHandler):
         return "ok", text, think, meta
 
     def _devin_nonstream_attempt(self, api_key, model, messages, frame, suffix,
-                                 temperature, max_tokens, final):
-        """One guarded non-stream attempt. Returns (outcome, text, think, meta)."""
+                                 temperature, max_tokens, final, tools=False,
+                                 tool_defs=None, native_tools=False,
+                                 tool_choice=None):
+        """One guarded non-stream attempt. Returns (outcome, text, think, meta).
+
+        Tools ride the same channels as the stream path: native declarations
+        (field 10) answer with deltaToolCalls, the text protocol is parsed out
+        of the answer. Parsed calls come back in meta["calls"]; text is
+        already marker-stripped when tools were involved.
+        """
         text = ""
         think = ""
         meta = {}
+        native_calls = []
+        usage = {}
         try:
             for ev, val in chat_stream(
                     api_key, model, messages, frame_note=frame,
                     system_suffix=suffix, temperature=temperature,
-                    max_tokens=max_tokens):
+                    max_tokens=max_tokens, tools=tool_defs,
+                    tool_choice=tool_choice, native_tools=native_tools):
                 if ev == "thinking":
                     think += val
                 elif ev == "text":
                     text += val
+                elif ev == "toolcalls":
+                    native_calls = val or []
+                elif ev == "usage":
+                    usage = val or {}
+                    meta = dict(meta or {})
+                    meta["usage"] = usage
                 elif ev == "reasoning_meta":
-                    meta = val
+                    meta = dict(val or {})
+                    if usage:
+                        meta["usage"] = usage
                 elif ev == "blocked":
                     log(f"devin upstream blocked (nonstream): {val}")
                     return "blocked", "", "", {"blocked": str(val)}
                 elif ev == "error":
+                    if _is_bad_request(val):
+                        log(f"devin upstream rejected the payload: {val}")
+                        return "bad_request", "", "", {"error": str(val)}
                     if not final:
                         log(f"devin nonstream error before delivery: {val}")
                         return "refused", "", "", {}
@@ -2223,6 +2434,14 @@ class Handler(BaseHTTPRequestHandler):
                 return "refused", "", "", {}
             self._send_json_error(502, json.dumps({"error": {"message": str(e)}}).encode(), "devin upstream error")
             return "error", "", "", {}
+        if native_calls:
+            calls = [{"id": c.get("id") or ("call_" + uuid.uuid4().hex[:12]),
+                      "type": "function",
+                      "function": {"name": c.get("name"),
+                                   "arguments": c.get("arguments") or "{}"}}
+                     for c in native_calls if c.get("name")]
+            if calls:
+                return "ok", text, think, {**meta, "calls": calls}
         if not final and not text.strip():
             # Reasoning-only attempt: the model thought and emitted nothing.
             # Retry (same ladder) instead of delivering an empty answer.
@@ -2231,6 +2450,9 @@ class Handler(BaseHTTPRequestHandler):
         if not final and text and REFUSAL_RE.search(_norm(text[:GUARD_CHARS * 2])):
             log(f"devin refusal snippet (nonstream): {_norm(text)[:180]!r}")
             return "refused", "", "", {}
+        if tools:
+            clean, calls = parse_tool_text(text)
+            return "ok", clean, think, {**meta, "calls": calls}
         return "ok", text, think, meta
 
 
